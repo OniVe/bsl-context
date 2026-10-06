@@ -435,14 +435,13 @@ pub(crate) fn check_type_dot_members(
         let head = dot.head.as_str();
         let member = dot.member.as_str();
 
-        // Уровень 1: head — это имя платформенного типа.
-        // Уровень 2: head может быть локальной переменной с известным типом.
-        let resolved_type_name: Option<String> = match index.find_type(head) {
-            Some(_) => Some(head.to_string()),
-            None => scope_map
-                .and_then(|sm| sm.type_of_var(dot.head_byte, head))
-                .cloned(),
-        };
+        // Уровень 1/2: локальная переменная со выведенным типом ПЕРЕКРЫВАЕТ
+        // имя платформенного типа (`Массив = Новый ТаблицаЗначений` — валидный
+        // код); имя типа — фолбэк, когда связывания нет.
+        let resolved_type_name: Option<String> = scope_map
+            .and_then(|sm| sm.type_of_var(dot.head_byte, head))
+            .map(str::to_string)
+            .or_else(|| index.find_type(head).map(|_| head.to_string()));
         let Some(type_name) = resolved_type_name else {
             continue; // head — обычная переменная без выведенного типа
         };
@@ -451,17 +450,22 @@ pub(crate) fn check_type_dot_members(
         };
 
         if ty.is_enum() {
-            if ty.is_open_enum() {
-                // Открытая коллекция (`ЦветаСтиля`, `БиблиотекаКартинок`):
-                // значения добавляет конфигурация, справка платформы их не
-                // знает. Проверка дала бы high-находку на каждый прикладной
-                // цвет или картинку (issue #2) — пропускаем.
+            if ty.is_open_enum() || has_range_values(ty) {
+                // Открытая коллекция (`ЦветаСтиля`) или диапазонные значения
+                // (`A...Z`, `F1...F12` — `Клавиша`): справка перечисляет
+                // значения условно, проверка по списку даёт ложные находки
+                // (issue #2; `Клавиша.P` — 15 High на ЗУП).
                 continue;
             }
-            // Проверяем что member — одно из enum_values (ru/en).
+            // Проверяем, что member — одно из enum_values (ru/en). Сравнение
+            // снисходительно к гомоглифам кириллица/латиница (`Веcь`).
             let m_lower = member.to_lowercase();
             let exists = ty.enum_values.iter().any(|v| {
-                v.name_ru.to_lowercase() == m_lower || v.name_en.to_lowercase() == m_lower
+                v.name_ru.to_lowercase() == m_lower
+                    || (!v.name_en.is_empty() && v.name_en.to_lowercase() == m_lower)
+                    || names_eq_loose(&v.name_ru.to_lowercase(), &m_lower)
+                    || (!v.name_en.is_empty()
+                        && names_eq_loose(&v.name_en.to_lowercase(), &m_lower))
             });
             if !exists {
                 let (line, col) = pos_at(src, dot.member_byte);
@@ -566,15 +570,18 @@ pub(crate) fn check_new_expressions(
     for n in news {
         if index.find_type(&n.type_name).is_none() {
             let (line, col) = pos_at(src, n.byte);
-            let all_types: Vec<String> = index.types.values().map(|t| t.name_ru.clone()).collect();
+            // Сортировка — детерминированный порядок кандидатов при равном
+            // сходстве (обход HashMap случаен; подсказка плавала между запусками).
+            let mut all_types: Vec<String> =
+                index.types.values().map(|t| t.name_ru.clone()).collect();
+            all_types.sort();
             let suggestion = closest_str(&n.type_name, &all_types);
             errors.push(ExprError::new(
                 line,
                 col,
                 ExprErrorKind::UnknownNewType,
                 format!(
-                    "Тип '{}' не найден в платформенном контексте (Новый '{}').{}",
-                    n.type_name,
+                    "Тип '{}' не найден в платформенном контексте.{}",
                     n.type_name,
                     suggestion
                         .as_ref()
@@ -783,13 +790,59 @@ pub(crate) fn pos_at(src: &str, byte_idx: usize) -> (u32, u32) {
     (line, col)
 }
 
+/// Имена равны с точностью до визуально неразличимых гомоглифов кириллицы и
+/// латиницы: справка 1С пишет `БлокироватьВеcьИнтерфейс` с латинской `c`,
+/// а код — с кириллической `с`; без свёртки это давало 78 High-находок на
+/// валидном коде ЗУП.
+pub(crate) fn names_eq_loose(a_lower: &str, b_lower: &str) -> bool {
+    a_lower == b_lower || fold_homoglyphs(a_lower) == fold_homoglyphs(b_lower)
+}
+
+fn fold_homoglyphs(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'а' => 'a',
+            'в' => 'b',
+            'е' | 'ё' => 'e',
+            'к' => 'k',
+            'м' => 'm',
+            'н' => 'h',
+            'о' => 'o',
+            'р' => 'p',
+            'с' => 'c',
+            'т' => 't',
+            'у' => 'y',
+            'х' => 'x',
+            'і' => 'i',
+            'ѕ' => 's',
+            'ј' => 'j',
+            _ => c,
+        })
+        .collect()
+}
+
+/// У типа-перечисления есть диапазонные значения (`A...Z`, `F1...F12` —
+/// `Клавиша`): справка перечисляет их условно, проверка конкретного значения
+/// по списку давала ложные находки (`Клавиша.P`).
+pub(crate) fn has_range_values(ty: &platform_index::Type) -> bool {
+    ty.enum_values
+        .iter()
+        .any(|v| v.name_ru.contains("...") || v.name_en.contains("..."))
+}
+
 fn closest_str(target: &str, candidates: &[String]) -> Option<String> {
     let target_l = target.to_lowercase();
+    // Тай-брейк по имени: при равном сходстве порядок кандидатов не должен
+    // влиять на подсказку (недетерминизм ловился запуском).
     candidates
         .iter()
         .map(|c| (similarity(&target_l, &c.to_lowercase()), c.clone()))
-        .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
         .filter(|(s, _)| *s > 0.5)
+        .max_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.1.cmp(&a.1))
+        })
         .map(|(_, c)| c)
 }
 
@@ -964,6 +1017,7 @@ mod tests {
             return_type: "Строка".into(),
             signatures: vec![Signature {
                 name: "Основная".into(),
+                syntax: String::new(),
                 description: String::new(),
                 parameters: vec![
                     Parameter {

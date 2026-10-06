@@ -39,7 +39,19 @@ pub struct Scope {
     /// Включающий байтовый диапазон `[start..end)`.
     pub byte_start: usize,
     pub byte_end: usize,
-    pub vars: HashMap<String, String>,
+    /// Присваивания в порядке появления: имя получает тип С этой позиции.
+    /// Хранить только последнее присваивание нельзя: `Т = Новый Массив;
+    /// Т.Добавить(1); Т = Новый Запрос;` давало ложную находку на `Добавить`
+    /// (тип брался общий, без учёта позиции).
+    pub vars: Vec<VarBinding>,
+}
+
+/// Одно присваивание: начиная с байта `byte` имя `name` имеет тип `ty`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VarBinding {
+    pub byte: usize,
+    pub name: String,
+    pub ty: String,
 }
 
 impl Scope {
@@ -60,10 +72,17 @@ impl ScopeMap {
         self.scopes.iter().find(|s| s.contains(byte_idx))
     }
 
-    /// Получить тип переменной по имени, регистронезависимо.
-    pub fn type_of_var(&self, byte_idx: usize, var_name: &str) -> Option<&String> {
+    /// Получить тип переменной по имени на момент `byte_idx`, регистронезависимо:
+    /// последнее присваивание не позже этой позиции.
+    pub fn type_of_var(&self, byte_idx: usize, var_name: &str) -> Option<&str> {
         let scope = self.lookup(byte_idx)?;
-        scope.vars.get(&var_name.to_lowercase())
+        let name = var_name.to_lowercase();
+        scope
+            .vars
+            .iter()
+            .rev()
+            .find(|b| b.byte <= byte_idx && b.name == name)
+            .map(|b| b.ty.as_str())
     }
 }
 
@@ -71,8 +90,10 @@ fn proc_block_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         // (?is) — case-insensitive + dot matches newline.
+        // Английские ключевые слова — наравне с русскими: англоязычный модуль
+        // иначе не сегментировался и scope-ы процедур смешивались.
         Regex::new(
-            r"(?is)(?P<head>(?:Процедура|Функция)\s+\w+\s*\([^)]*\))(?P<body>.*?)(?P<tail>КонецПроцедуры|КонецФункции)",
+            r"(?is)(?P<head>\b(?:Процедура|Функция|Procedure|Function)\s+\w+\s*\([^)]*\))(?P<body>.*?)(?P<tail>\b(?:КонецПроцедуры|КонецФункции|EndProcedure|EndFunction))",
         )
         .unwrap()
     })
@@ -146,22 +167,89 @@ pub fn extract_scope_map(
     ScopeMap { scopes }
 }
 
-/// Извлечь все аннотации `// @type ТипX` из ИСХОДНОГО (не очищенного) текста.
+/// Извлечь все аннотации `// @type ТипX` из ИСХОДНОГО текста.
 /// Возвращает `byte_offset_следующей_строки → ТипX`. Аннотация применяется к
-/// первому присваиванию на строке annotation_line+1 или дальше (до пустой строки).
+/// первому присваиванию в ТОЙ ЖЕ процедуре не раньше строки annotation_line+1.
 pub fn extract_type_annotations(src: &str) -> HashMap<usize, String> {
+    // Аннотации ищем в тексте с замаскированными СТРОКОВЫМИ литералами:
+    // `// @type` внутри строки аннотацией не является, а комментарии не
+    // маскируются — именно в них аннотации и живут. Длина сохраняется,
+    // поэтому смещения валидны для оригинала.
+    let cleaned = mask_strings_only(src);
     let mut out = HashMap::new();
-    for cap in type_annot_re().captures_iter(src) {
+    for cap in type_annot_re().captures_iter(&cleaned) {
         let ty = cap.name("ty").unwrap().as_str().to_string();
         let m = cap.get(0).unwrap();
         // Найти конец строки, где аннотация
-        let end_of_line = src[m.end()..]
+        let end_of_line = cleaned[m.end()..]
             .find('\n')
             .map(|i| m.end() + i + 1)
-            .unwrap_or(src.len());
+            .unwrap_or(cleaned.len());
         out.insert(end_of_line, ty);
     }
     out
+}
+
+/// Замаскировать только строковые литералы (длина сохраняется). Копия
+/// `bsl_parse::mask_strings_and_comments` без ветки комментариев: для поиска
+/// `// @type` они должны остаться на месте.
+fn mask_strings_only(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out = bytes.to_vec();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'"' {
+            out[i] = b' ';
+            let mut j = i + 1;
+            while j < bytes.len() {
+                if bytes[j] == b'"' {
+                    if j + 1 < bytes.len() && bytes[j + 1] == b'"' {
+                        out[j] = b' ';
+                        out[j + 1] = b' ';
+                        j += 2;
+                        continue;
+                    }
+                    out[j] = b' ';
+                    j += 1;
+                    break;
+                }
+                if bytes[j] == b'\n' {
+                    j += 1;
+                    // Между строками-продолжениями допустим комментарий —
+                    // его байты тоже внутри литерала, маскируем.
+                    let mut k = j;
+                    while k < bytes.len() && (bytes[k] == b' ' || bytes[k] == b'\t') {
+                        k += 1;
+                    }
+                    if k + 1 < bytes.len() && bytes[k] == b'/' && bytes[k + 1] == b'/' {
+                        while k < bytes.len() && bytes[k] != b'\n' {
+                            if bytes[k] != b'\r' {
+                                out[k] = b' ';
+                            }
+                            k += 1;
+                        }
+                        j = k;
+                    }
+                    continue;
+                }
+                if bytes[j] != b'\r' {
+                    out[j] = b' ';
+                }
+                j += 1;
+            }
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    String::from_utf8(out).expect("маскировка пробелами сохраняет UTF-8")
 }
 
 fn build_scope(
@@ -172,7 +260,7 @@ fn build_scope(
     annotations: &HashMap<usize, String>,
     level: u8,
 ) -> Scope {
-    let mut vars: HashMap<String, String> = HashMap::new();
+    let mut vars: Vec<VarBinding> = Vec::new();
 
     // Абсолютные смещения ВСЕХ присваиваний тела: по ним видно, израсходована
     // ли аннотация. Без этого `// @type` цеплялась к каждому присваиванию в
@@ -202,7 +290,13 @@ fn build_scope(
         let mut typ: Option<String> = annotations
             .iter()
             .filter(|(&annot_end, _)| {
-                annot_end <= abs_start && abs_start.saturating_sub(annot_end) <= 200
+                // Аннотация обязана принадлежать ЭТОЙ процедуре и стоять до
+                // присваивания: иначе хвостовая аннотация процедуры А
+                // «расходовалась» на первое присваивание процедуры Б.
+                annot_end >= byte_start
+                    && annot_end < byte_end
+                    && annot_end <= abs_start
+                    && abs_start.saturating_sub(annot_end) <= 200
             })
             .filter(|(&annot_end, _)| {
                 !assign_starts
@@ -246,7 +340,11 @@ fn build_scope(
         }
 
         if let Some(t) = typ {
-            vars.insert(lhs.to_lowercase(), t);
+            vars.push(VarBinding {
+                byte: abs_start,
+                name: lhs.to_lowercase(),
+                ty: t,
+            });
         }
     }
 
@@ -383,12 +481,17 @@ fn primary_type(index: &PlatformIndex, raw: &str) -> Option<String> {
 /// тип пустой/«Произвольный») → `None` (тип не выводим, ошибку не порождаем).
 fn resolve_chain_type(
     index: &PlatformIndex,
-    vars: &HashMap<String, String>,
+    seen: &[VarBinding],
     segs: &[ChainSeg],
 ) -> Option<String> {
     let head = &segs[0];
-    let mut cur = if let Some(t) = vars.get(&head.name.to_lowercase()) {
-        t.clone()
+    let mut cur = if let Some(t) = seen
+        .iter()
+        .rev()
+        .find(|b| b.name == head.name.to_lowercase())
+        .map(|b| b.ty.clone())
+    {
+        t
     } else if head.is_call {
         let m = index.find_global_method(&head.name)?;
         primary_type(index, &m.return_type)?
@@ -401,14 +504,16 @@ fn resolve_chain_type(
     for seg in &segs[1..] {
         let ty = index.find_type(&cur)?;
         let key = seg.name.to_lowercase();
-        let next = if let Some(m) = ty
-            .methods
-            .iter()
-            .find(|m| m.name_ru.to_lowercase() == key || m.name_en.to_lowercase() == key)
-        {
-            m.return_type.clone()
+        // Метод резолвится только для вызова (`Выполнить()`); обращение без
+        // скобок (`Р = З.Выполнить;`) методом не является — иначе выводился
+        // return_type у не-вызова.
+        let next = if seg.is_call {
+            ty.methods
+                .iter()
+                .find(|m| m.name_ru.to_lowercase() == key || m.name_en.to_lowercase() == key)?
+                .return_type
+                .clone()
         } else {
-            // член не найден — тип не выводим
             ty.properties
                 .iter()
                 .find(|p| p.name_ru.to_lowercase() == key || p.name_en.to_lowercase() == key)?
@@ -488,6 +593,7 @@ mod tests {
         ));
         idx.insert_type(ty("Строка", vec![], vec![]));
         idx.insert_type(ty("Булево", vec![], vec![]));
+        idx.insert_type(ty("Массив", vec![], vec![]));
         idx.global_methods
             .push(method("ПолучитьОбщийМакет", "ТабличныйДокумент"));
         idx.insert_type(ty("ТабличныйДокумент", vec![], vec![]));
@@ -540,7 +646,7 @@ mod tests {
     #[test]
     fn resolve_chain_method_return_type() {
         let idx = mock_index();
-        let vars = HashMap::new();
+        let vars: Vec<VarBinding> = Vec::new();
         let segs = parse_chain("Запрос.Выполнить()").unwrap();
         assert_eq!(
             resolve_chain_type(&idx, &vars, &segs),
@@ -551,7 +657,7 @@ mod tests {
     #[test]
     fn resolve_chain_multi_level() {
         let idx = mock_index();
-        let vars = HashMap::new();
+        let vars: Vec<VarBinding> = Vec::new();
         let segs = parse_chain("Запрос.Выполнить().Выбрать()").unwrap();
         assert_eq!(
             resolve_chain_type(&idx, &vars, &segs),
@@ -562,8 +668,11 @@ mod tests {
     #[test]
     fn resolve_chain_via_var_and_property() {
         let idx = mock_index();
-        let mut vars = HashMap::new();
-        vars.insert("рез".to_string(), "РезультатЗапроса".to_string());
+        let vars = vec![VarBinding {
+            byte: 0,
+            name: "рез".to_string(),
+            ty: "РезультатЗапроса".to_string(),
+        }];
         // голова — переменная с выведенным типом
         let segs = parse_chain("Рез.Выбрать()").unwrap();
         assert_eq!(
@@ -603,7 +712,7 @@ mod tests {
     #[test]
     fn resolve_chain_global_method() {
         let idx = mock_index();
-        let vars = HashMap::new();
+        let vars: Vec<VarBinding> = Vec::new();
         let segs = parse_chain("ПолучитьОбщийМакет()").unwrap();
         assert_eq!(
             resolve_chain_type(&idx, &vars, &segs),
@@ -614,7 +723,7 @@ mod tests {
     #[test]
     fn resolve_chain_unknown_member_returns_none() {
         let idx = mock_index();
-        let vars = HashMap::new();
+        let vars: Vec<VarBinding> = Vec::new();
         let segs = parse_chain("Запрос.НетТакогоМетода()").unwrap();
         assert_eq!(resolve_chain_type(&idx, &vars, &segs), None);
     }
@@ -640,5 +749,45 @@ mod tests {
         let map2 = extract_scope_map(&idx, src, &annotations, 2);
         assert_var(&map2, src.len() - 1, "запрос", "Запрос"); // из Новый — есть
         assert!(map2.type_of_var(src.len() - 1, "рез").is_none()); // из вызова — нет на level=2
+    }
+
+    /// Переприсваивание: тип берётся на момент использования, а не общий
+    /// последний (`Т = Массив; Т.Добавить(); Т = Запрос;` — `Добавить` валиден).
+    #[test]
+    fn reassignment_uses_type_at_position() {
+        let idx = mock_index();
+        let src = "Т = Новый Массив;\nТ.Добавить(1);\nТ = Новый Запрос;\n";
+        let map = extract_scope_map(&idx, src, &HashMap::new(), 2);
+        let use_byte = src.find("Т.Добавить").unwrap();
+        assert_eq!(map.type_of_var(use_byte, "т"), Some("Массив"));
+        assert_eq!(map.type_of_var(src.len() - 1, "т"), Some("Запрос"));
+    }
+
+    /// `// @type` не протекает в следующую процедуру.
+    #[test]
+    fn annotation_does_not_leak_to_next_procedure() {
+        let idx = mock_index();
+        let src = "Процедура А()\n// @type Запрос\nКонецПроцедуры\nПроцедура Б()\nХ = Новый Массив;\nКонецПроцедуры\n";
+        let annotations = extract_type_annotations(src);
+        let map = extract_scope_map(&idx, src, &annotations, 3);
+        let use_byte = src.find("Х =").unwrap();
+        assert_eq!(map.type_of_var(use_byte, "х"), Some("Массив"));
+    }
+
+    /// `// @type` внутри строкового литерала аннотацией не является.
+    #[test]
+    fn annotation_inside_string_is_ignored() {
+        let src = "С = \"// @type Число\";\n";
+        assert!(extract_type_annotations(src).is_empty());
+    }
+
+    /// Англоязычные `Procedure/Function … EndProcedure/EndFunction` сегментируются.
+    #[test]
+    fn english_procedures_are_segmented() {
+        let idx = mock_index();
+        let src = "Function Test()\nT = New Запрос;\nEndFunction\n";
+        let map = extract_scope_map(&idx, src, &HashMap::new(), 2);
+        assert_eq!(map.scopes.len(), 1, "{:?}", map.scopes);
+        assert!(map.scopes[0].vars.iter().any(|b| b.ty == "Запрос"));
     }
 }

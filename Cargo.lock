@@ -253,16 +253,11 @@ dependencies = [
 name = "bsl-validator"
 version = "0.19.1"
 dependencies = [
- "anyhow",
  "bsl-parse",
  "platform-index",
  "regex",
  "sdbl-parse",
  "serde",
- "thiserror",
- "tracing",
- "tree-sitter",
- "tree-sitter-bsl",
 ]
 
 [[package]]
@@ -2467,6 +2462,7 @@ dependencies = [
  "bytes",
  "http",
  "http-body",
+ "http-body-util",
  "pin-project-lite",
  "tower-layer",
  "tower-service",

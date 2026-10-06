@@ -3,16 +3,11 @@ name = "bsl-validator"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Валидатор BSL-выражений: tree-sitter → извлечение Идентификатор.Член → проверка через PlatformIndex"
+description = "Валидатор BSL-кода: объявления, директивы, выражения, правила запросов (разбор — в bsl-parse)"
 
 [dependencies]
 platform-index = { path = "../platform-index", version = "0.19.1" }
 bsl-parse = { path = "../bsl-parse", version = "0.19.1" }
 sdbl-parse = { path = "../sdbl-parse", version = "0.19.1" }
-tree-sitter = { workspace = true }
-tree-sitter-bsl = { workspace = true }
 serde = { workspace = true }
-anyhow = { workspace = true }
-thiserror = { workspace = true }
-tracing = { workspace = true }
 regex = { workspace = true }
